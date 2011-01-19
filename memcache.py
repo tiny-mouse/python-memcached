@@ -43,6 +43,7 @@ Detailed Documentation
 More detailed documentation is available in the L{Client} class.
 """
 
+import hashlib
 import sys
 import socket
 import time
@@ -53,7 +54,15 @@ try:
 except ImportError:
     import pickle
 
+from bisect import bisect_left, insort_left
 from binascii import crc32   # zlib version is not cross-platform
+
+def md5_hash(key):
+    return hashlib.md5(key).digest()
+
+def sha1_hash(key):
+    return hashlib.sha1(key).digest()
+
 def cmemcache_hash(key):
     return((((crc32(key) & 0xffffffff) >> 16) & 0x7fff) or 1)
 serverHashFunction = cmemcache_hash
@@ -100,6 +109,68 @@ except ImportError:
     # TODO:  add the pure-python local implementation
     class local(object):
         pass
+
+class Router(object):
+
+    def __init__(self, servers):
+        self.servers = servers
+        self._init_buckets()
+
+    def _init_buckets(self):
+        self.buckets = []
+        for server in self.servers:
+            for i in range(server.weight):
+                self.buckets.append(server)
+
+    def get_server(self, key):
+        if isinstance(key, tuple):
+            serverhash, key = key
+        else:
+            serverhash = serverHashFunction(key)
+
+        for i in range(Client._SERVER_RETRIES):
+            server = self.buckets[serverhash % len(self.buckets)]
+            if server.connect():
+                #print "(using server %s)" % server,
+                return server, key
+            serverhash = serverHashFunction(str(serverhash) + str(i))
+        return None, None
+
+class ConsistentRouter(object):
+    
+    def __init__(self, servers, count=500, hash_fn=sha1_hash):
+        self.count = count
+        self.hash_fn = hash_fn
+        self.map = []
+        [self.add_node(server) for server in servers]
+    
+    def __node_keys(self, node):
+        for x in range(self.count):
+            yield self.hash_fn("%s-%d" % (node, x))
+
+    def add_node(self, node):
+        for key in self.__node_keys(node):
+            insort_left(self.map, (key, node))
+
+    def remove_node(self, node):
+        for key in self.__node_keys(node):
+            i = bisect_left(self.map, (key, node))
+            assert self.map[i][1] == node
+            del self.map[i]
+
+    def get_node(self, key):
+        h = self.hash_fn(key)
+        i = bisect_left(self.map, (h, ""))
+        if i >= len(self.map):
+            i = 0
+        for step in range(Client._SERVER_RETRIES):
+            server = self.map[(i+step)%len(self.map)][1]
+            if server.connect():
+                return server
+        return None
+
+    def get_server(self, key):
+        return self.get_node(key), key
 
 
 class Client(local):
@@ -148,7 +219,7 @@ class Client(local):
                  pickler=pickle.Pickler, unpickler=pickle.Unpickler,
                  pload=None, pid=None, server_max_key_length=SERVER_MAX_KEY_LENGTH,
                  server_max_value_length=SERVER_MAX_VALUE_LENGTH,
-                 dead_retry=DEAD_RETRY, socket_timeout=SOCKET_TIMEOUT):
+                 dead_retry=DEAD_RETRY, socket_timeout=SOCKET_TIMEOUT, router_class=Router):
         """
         Create a new Client object with the given list of servers.
 
@@ -166,6 +237,7 @@ class Client(local):
         local.__init__(self)
         self.debug = debug
         self.set_servers(servers, dead_retry, socket_timeout)
+        self.router = router_class(self.servers)
         self.stats = {}
         self.cas_ids = {}
 
@@ -197,7 +269,6 @@ class Client(local):
             an integer weight value.
         """
         self.servers = [_Host(s, self.debug, dead_retry, socket_timeout) for s in servers]
-        self._init_buckets()
 
     def get_stats(self):
         '''Get statistics from each of the servers.
@@ -273,26 +344,6 @@ class Client(local):
         """
         for s in self.servers:
             s.deaduntil = 0
-
-    def _init_buckets(self):
-        self.buckets = []
-        for server in self.servers:
-            for i in range(server.weight):
-                self.buckets.append(server)
-
-    def _get_server(self, key):
-        if isinstance(key, tuple):
-            serverhash, key = key
-        else:
-            serverhash = serverHashFunction(key)
-
-        for i in range(Client._SERVER_RETRIES):
-            server = self.buckets[serverhash % len(self.buckets)]
-            if server.connect():
-                #print "(using server %s)" % server,
-                return server, key
-            serverhash = serverHashFunction(str(serverhash) + str(i))
-        return None, None
 
     def disconnect_all(self):
         for s in self.servers:
@@ -374,7 +425,7 @@ class Client(local):
         @rtype: bool
         '''
         self.check_key(key)
-        server, key = self._get_server(key)
+        server, key = self.router.get_server(key)
         if not server:
             return False
         self._statlog('delete')
@@ -432,7 +483,7 @@ class Client(local):
 
     def _incrdecr(self, cmd, key, delta):
         self.check_key(key)
-        server, key = self._get_server(key)
+        server, key = self.router.get_server(key)
         if not server:
             return 0
         self._statlog(cmd)
@@ -566,13 +617,13 @@ class Client(local):
         # build up a list for each server of all the keys we want.
         for orig_key in key_iterable:
             if isinstance(orig_key, tuple):
-                # Tuple of hashvalue, key ala _get_server(). Caller is essentially telling us what server to stuff this on.
-                # Ensure call to _get_server gets a Tuple as well.
+                # Tuple of hashvalue, key ala self.router.get_server(). Caller is essentially telling us what server to stuff this on.
+                # Ensure call to self.router.get_server gets a Tuple as well.
                 str_orig_key = str(orig_key[1])
-                server, key = self._get_server((orig_key[0], key_prefix + str_orig_key)) # Gotta pre-mangle key before hashing to a server. Returns the mangled key.
+                server, key = self.router.get_server((orig_key[0], key_prefix + str_orig_key)) # Gotta pre-mangle key before hashing to a server. Returns the mangled key.
             else:
                 str_orig_key = str(orig_key) # set_multi supports int / long keys.
-                server, key = self._get_server(key_prefix + str_orig_key)
+                server, key = self.router.get_server(key_prefix + str_orig_key)
 
             # Now check to make sure key length is proper ...
             self.check_key(str_orig_key, key_extra_len=key_extra_len)
@@ -719,7 +770,7 @@ class Client(local):
 
     def _set(self, cmd, key, val, time, min_compress_len = 0):
         self.check_key(key)
-        server, key = self._get_server(key)
+        server, key = self.router.get_server(key)
         if not server:
             return False
 
@@ -748,7 +799,7 @@ class Client(local):
 
     def _get(self, cmd, key):
         self.check_key(key)
-        server, key = self._get_server(key)
+        server, key = self.router.get_server(key)
         if not server:
             return None
 
