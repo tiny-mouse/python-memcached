@@ -82,6 +82,8 @@ __version__ = "1.45-patched"
 __copyright__ = "Copyright (C) 2003 Danga Interactive"
 __license__   = "Python"
 
+DEAD_RETRY=30
+SOCKET_TIMEOUT=3
 SERVER_MAX_KEY_LENGTH = 250
 #  Storing values larger than 1MB requires recompiling memcached.  If you do,
 #  this value can be changed by doing "memcache.SERVER_MAX_VALUE_LENGTH = N"
@@ -145,7 +147,8 @@ class Client(local):
     def __init__(self, servers, debug=0, pickleProtocol=0,
                  pickler=pickle.Pickler, unpickler=pickle.Unpickler,
                  pload=None, pid=None, server_max_key_length=SERVER_MAX_KEY_LENGTH,
-                 server_max_value_length=SERVER_MAX_VALUE_LENGTH):
+                 server_max_value_length=SERVER_MAX_VALUE_LENGTH,
+                 dead_retry=DEAD_RETRY, socket_timeout=SOCKET_TIMEOUT):
         """
         Create a new Client object with the given list of servers.
 
@@ -162,7 +165,7 @@ class Client(local):
         """
         local.__init__(self)
         self.debug = debug
-        self.set_servers(servers)
+        self.set_servers(servers, dead_retry, socket_timeout)
         self.stats = {}
         self.cas_ids = {}
 
@@ -183,7 +186,7 @@ class Client(local):
         except TypeError:
             self.picklerIsKeyword = False
 
-    def set_servers(self, servers):
+    def set_servers(self, servers, dead_retry, socket_timeout):
         """
         Set the pool of servers used by this client.
 
@@ -193,7 +196,7 @@ class Client(local):
             2. Tuples of the form C{("host:port", weight)}, where C{weight} is
             an integer weight value.
         """
-        self.servers = [_Host(s, self.debug) for s in servers]
+        self.servers = [_Host(s, self.debug, dead_retry, socket_timeout) for s in servers]
         self._init_buckets()
 
     def get_stats(self):
@@ -945,10 +948,10 @@ class Client(local):
 
 
 class _Host(object):
-    _DEAD_RETRY = 30  # number of seconds before retrying a dead server.
-    _SOCKET_TIMEOUT = 3  #  number of seconds before sockets timeout.
 
-    def __init__(self, host, debug=0):
+    def __init__(self, host, debug=0, dead_retry=30, socket_timeout=3):
+        self.dead_retry = dead_retry
+        self.socket_timeout = socket_timeout
         self.debug = debug
         if isinstance(host, tuple):
             host, self.weight = host
@@ -996,7 +999,7 @@ class _Host(object):
 
     def mark_dead(self, reason):
         self.debuglog("MemCache: %s: %s.  Marking dead." % (self, reason))
-        self.deaduntil = time.time() + _Host._DEAD_RETRY
+        self.deaduntil = time.time() + self.dead_retry
         self.close_socket()
 
     def _get_socket(self):
@@ -1005,7 +1008,7 @@ class _Host(object):
         if self.socket:
             return self.socket
         s = socket.socket(self.family, socket.SOCK_STREAM)
-        if hasattr(s, 'settimeout'): s.settimeout(self._SOCKET_TIMEOUT)
+        if hasattr(s, 'settimeout'): s.settimeout(self.socket_timeout)
         try:
             s.connect(self.address)
         except socket.timeout, msg:
