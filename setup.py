@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from distutils.core import setup
+from setuptools import setup
 import memcache
 
 setup(name="python-memcached",
@@ -13,6 +13,10 @@ setup(name="python-memcached",
       maintainer_email="jess.m.stanton@gmail.com",
       url="http://github.com/jess-is-coding/python-memcached",
       py_modules=["memcache"],
+      zip_safe=False,
+      package_data = {
+          '': ['*.py'],
+      },
       classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Intended Audience :: Developers",
